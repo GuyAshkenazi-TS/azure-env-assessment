@@ -42,7 +42,7 @@ For best results, make sure your user has:
    Copy and paste the following command:
 
    ```bash
-   bash -c "$(curl -fsSL https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment-/refs/heads/main/azure-env-assessment.sh)"
+   bash -c "$(curl -fsSL https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure-env-assessment.sh)"
    ```
 
 The script will execute and generate the output files directly in your Cloud Shell home directory.
@@ -94,7 +94,7 @@ Download via Cloud Shell GUI
 
 If you are already in the correct tenant and Cloud Shell (Bash), just run:
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment-/refs/heads/main/azure-env-assessment.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure-env-assessment.sh)"
 ```
 
 

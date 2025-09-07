@@ -106,14 +106,6 @@ If the **Sub. Owner** column shows:
 - *“Check in Portal – classic subscription”*  
 - *“Check in EA portal – Account Owner”*  
 
-👉 Follow these steps manually:
-
-1. Sign in to the [Azure Portal](https://portal.azure.com).  
-2. Go to **Subscriptions**.  
-3. Select the relevant subscription.  
-4. Open **Settings → Properties** (or directly **Properties** in some UI versions).  
-5. Copy the value under **Account admin** — that’s the subscription’s **classic owner**.
-
 ---
 👉 If you see one of these in the **CSV output**, follow the steps below to get the information manually.
 

@@ -1,23 +1,39 @@
-python3 - <<'PY'
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Azure Migration Assessor – unified, auto, read-only
-# CSVs:
-# 1) azure_env_discovery_<ts>.csv         -> Subscription ID, Sub. Type, Sub. Owner, Transferable (Internal)
-# 2) non_transferable_reasons_<ts>.csv    -> non-transferables + why
-# 3) blockers_details_<ts>.csv            -> resource-level blockers (validateMoveResources + move-support table)
+"""
+Azure Migration Assessor – unified, auto, read-only
+
+מה הוא עושה:
+1) מיפוי כלל ה-Subscriptions והסקת סוג/בעלים/כשירות להעברה ל-EA
+   פלט: azure_env_discovery_<timestamp>.csv
+        עמודות: Subscription ID, Sub. Type, Sub. Owner, Transferable (Internal)
+
+2) לכל Subscription שלא ניתן להעברה ב-Billing Transfer:
+   סריקת blockers ברמת משאב באמצעות validateMoveResources (ללא שאלות).
+   * לא דורש EA. הוולידציה מתבצעת בין RG->RG בתוך אותו Subscription,
+     אל RG יעד שכבר קיים (לא נוצרים משאבים).
+   * בנוסף, הצלבה מול טבלת ה-"move-support" הרשמית לקביעת:
+     - "ילד חייב לנוע עם אב"
+     - "אב לא תומך במעבר Subscription" (לא יעזור לאחד RG)
+     - סוגי כשלים כלליים (Policy/Permissions/Provider וכו')
+   פלט: blockers_details_<timestamp>.csv
+
+3) סיכום סיבות ל-"לא ניתן להעברה" ברמת Subscription:
+   פלט: non_transferable_reasons_<timestamp>.csv
+"""
 
 import os, subprocess, json, csv, re, urllib.request
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
-# --- env (no prompts, dynamic install if needed) ---
+# ---- Env (no prompts, dynamic extension install if needed) ----
 os.environ.setdefault("AZURE_CORE_NO_COLOR", "1")
 os.environ.setdefault("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "yes_without_prompt")
 
 MISSING = "Not available"
 MOVE_SUPPORT_CSV = "https://raw.githubusercontent.com/tfitzmac/resource-capabilities/master/move-support-resources.csv"
 
-# ------------- AZ helpers -------------
+# ---------------- AZ helpers ----------------
 def az(cmd: List[str], check: bool = True):
     p = subprocess.run(cmd, capture_output=True, text=True)
     if check and p.returncode != 0:
@@ -32,6 +48,7 @@ def az_json(cmd: List[str], default: Any):
         return default
 
 def ensure_login():
+    # ב-Cloud Shell זה כבר מחובר; קריאה זו רק מאמתת
     az(["az","account","show","--only-show-errors"], check=False)
 
 # ------------- Offer / Owner / Transferability -------------
@@ -50,6 +67,7 @@ def offer_from_quota(quota_id: str, authorization_source: str, has_mca_billing_l
     return MISSING
 
 def transferable_to_ea(offer: str) -> str:
+    # לפי המטריצה הפנימית: ישיר רק עבור EA/PAYG
     return "Yes" if offer in ("EA","Pay-As-You-Go") else "No"
 
 def get_classic_account_admin_via_rest(sub_id: str) -> str:
@@ -152,19 +170,31 @@ def load_move_support_map() -> Dict[str,bool]:
     return support
 
 def parse_types(resource_id: str):
+    """
+    מחזיר: is_child, top_level_type, parent_id, parent_type
+    דוגמה Child: .../providers/Microsoft.Sql/servers/hmdev/databases/hmprod-stage2
+    """
     m = re.search(r"/providers/([^/]+)/([^/]+)(/.*)?", resource_id, re.IGNORECASE)
     if not m:
         return False, None, None, None
     ns, first_type, rest = m.group(1), m.group(2), m.group(3) or ""
     top_type = f"{ns}/{first_type}"
-    path = (rest or "").strip("/")
-    is_child=False; parent_id=None; parent_type=top_type
+
+    path = rest.strip("/")
+    is_child = False
+    parent_id = None
+    parent_type = top_type
+
     if path:
         segs = path.split("/")
-        if len(segs)>=3:
-            is_child=True
-            parent_id = re.sub(r"(/providers/[^/]+/[^/]+/[^/]+).*", r"\\1", resource_id, flags=re.IGNORECASE)
-            # (parent_type already = top_type)
+        # segs = [<top_name>, <maybe child_type>, <maybe child_name>, ...]
+        if len(segs) >= 3:
+            is_child = True
+            # שליפת מזהה אב עד ה-name של ה-top-level
+            m2 = re.search(r"(.*/providers/[^/]+/[^/]+/[^/]+)", resource_id, re.IGNORECASE)
+            if m2:
+                parent_id = m2.group(1)
+
     return is_child, top_type, parent_id, parent_type
 
 def classify_with_table(resource_id: str, details_msg: str, support_map: dict) -> Dict[str,Any]:
@@ -234,7 +264,7 @@ def extract_blocker_from_error(err: Dict[str,Any]) -> Tuple[str,str,str]:
 def main():
     ensure_login()
 
-    # discovery CSV (exact column names like Script #1)
+    # כותרות CSV (בדיוק כמו Script #1)
     headers_discovery = ["Subscription ID","Sub. Type","Sub. Owner","Transferable (Internal)"]
     headers_reasons   = ["Subscription ID","Sub. Type","ReasonCode","Why","DocRef"]
     headers_blockers  = ["SubscriptionId","ResourceGroup","ResourceId","ResourceTypeTopLevel","IsChild","ParentId","ParentType","ParentSupported","BlockerCategory","Why","DocRef"]
@@ -251,6 +281,7 @@ def main():
     out_blockers  = f"blockers_details_{ts}.csv"
 
     rows_discovery=[]; rows_reasons=[]; non_transferables=[]
+
     # ---- Stage 1: discovery
     for s in subs:
         sub_id = s.get("id",""); state = s.get("state","")
@@ -274,15 +305,14 @@ def main():
             non_transferables.append(sub_id)
 
     with open(out_discovery,"w",newline="",encoding="utf-8") as f:
-        csv.writer(f).writerows([headers_discovery, *rows_discovery])
+        w=csv.writer(f); w.writerow(headers_discovery); w.writerows(rows_discovery)
     with open(out_reasons,"w",newline="",encoding="utf-8") as f:
-        csv.writer(f).writerows([headers_reasons, *rows_reasons])
+        w=csv.writer(f); w.writerow(headers_reasons); w.writerows(rows_reasons)
 
     print(f"✅ Discovery CSV: {out_discovery}")
     print(f"✅ Reasons   CSV: {out_reasons}")
 
-    # ---- Stage 2: blockers for non-transferables (no EA required; intra-sub RG->RG)
-    # move-support table (best-effort)
+    # ---- Stage 2: blockers (intra-sub RG→RG, ללא יצירה)
     try:
         support_map = load_move_support_map()
     except Exception:
@@ -311,7 +341,6 @@ def main():
 
             if isinstance(result, dict) and "error" in result:
                 err_msg = json.dumps(result["error"], ensure_ascii=False)
-                # קודם כל מיפוי ע"פ ההודעה (למשל ResourceNotTopLevel) ואז cross-check עם טבלת התמיכה:
                 for rid in ids:
                     cls = classify_with_table(rid, err_msg, support_map)
                     if cls.get("BlockerCategory") != "None":
@@ -327,7 +356,7 @@ def main():
                             cls.get("DocRef","move-support")
                         ])
             else:
-                # אם אין error כללי – עדיין מתייגים ילדים שאסור להזיז לבד וכו'
+                # אין שגיאה כללית – עדיין נתייג “ילד חייב אב” וכו' לפי הטבלה
                 for rid in ids:
                     cls = classify_with_table(rid, "", support_map)
                     if cls.get("BlockerCategory") not in ("None",):
@@ -345,11 +374,10 @@ def main():
 
     if blockers_rows:
         with open(out_blockers,"w",newline="",encoding="utf-8") as f:
-            csv.writer(f).writerows([headers_blockers, *blockers_rows])
+            w=csv.writer(f); w.writerow(headers_blockers); w.writerows(blockers_rows)
         print(f"🔎 Blockers CSV: {out_blockers}")
     else:
         print("🔎 Blockers scan: no blockers detected by validateMoveResources (intra-sub) + move-support table.")
 
 if __name__ == "__main__":
     main()
-PY

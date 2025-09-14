@@ -1,63 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Azure Migration Assessor — single-file, runs from GitHub Raw
+Azure Migration Assessor – single-file, read-only
+- No local temp files required besides outputs
+- Loads move-support table ONLY from your repo CSV (or MOVE_SUPPORT_URL)
 
-What it does
-------------
-1) Discovers subscriptions (type/owner/transferable)
-2) Explains non-transferable reasons (offer/state/partner/etc.)
-3) Scans resource blockers per RG using:
-   - az resource invoke-action ... validateMoveResources (batch per RG)
-   - Official move-support table (Subscription column) from CSV on GitHub
+Outputs:
+1) azure_env_discovery_<ts>.csv
+2) non_transferable_reasons_<ts>.csv
+3) blockers_details_<ts>.csv
 
-How to run (Linux/macOS)
-------------------------
-python3 - <<'PY'
-# (paste this file's content here and run)
-PY
-
-OR (recommended once you push this script to your own GitHub):
-curl -sSL https://raw.githubusercontent.com/<org>/<repo>/<branch>/azure_migration_assessor.py \
-| python3 - --quiet
-
-Windows (PowerShell):
-iwr https://raw.githubusercontent.com/<org>/<repo>/<branch>/azure_migration_assessor.py -UseBasicParsing | `
-Select-Object -Expand Content | py - --quiet
-
-Flags
------
---support-url  : CSV URL (default: MS official GitHub raw)
---quiet        : suppress info logs (prints only the 3 CSV paths)
---no-validate  : skip ARM validateMoveResources calls (table-only mode)
+Rules:
+- Trust the support table (Subscription column) for move support.
+- Child must move with parent; we don't mark supported children as blockers.
+- If child supported but parent not → ParentNotSupported
+- If child not supported but parent supported → UnsupportedChildTypeCannotMove
+- If neither supported → UnsupportedResourceType
+- Any validateMoveResources policy/permission/lock/provider errors = blockers
 """
 
-import os, re, csv, json, argparse, logging, subprocess, urllib.request, urllib.error
+import os, subprocess, json, csv, io, re, urllib.request, logging
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
-# ---------------------- Args ----------------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Azure Migration Assessor (single-file, GitHub-raw)")
-    p.add_argument("--support-url",
-                   default="https://raw.githubusercontent.com/tfitzmac/resource-capabilities/master/move-support-resources.csv",
-                   help="GitHub raw CSV of move-support (Subscription column).")
-    p.add_argument("--quiet", action="store_true", help="Quiet mode (WARN+).")
-    p.add_argument("--no-validate", action="store_true",
-                   help="Skip validateMoveResources calls; rely on support table only.")
-    return p.parse_args()
-
-# ---------------------- Logging / Env -------------
-def setup_logging(quiet: bool):
-    lvl = logging.WARNING if quiet else logging.INFO
-    logging.basicConfig(level=lvl, format="%(asctime)s [%(levelname)s] %(message)s")
-
+# ---------------- Config ----------------
 os.environ.setdefault("AZURE_CORE_NO_COLOR", "1")
 os.environ.setdefault("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "yes_without_prompt")
+
+# default to your repo's CSV (can override with env MOVE_SUPPORT_URL)
+MOVE_SUPPORT_URL = os.getenv(
+    "MOVE_SUPPORT_URL",
+    "https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/move-support-resources-local.csv"
+)
 MISSING = "Not available"
 
-# ---------------------- AZ helpers ----------------
-def az(cmd: List[str], check: bool = True) -> Tuple[int,str,str]:
+# ---------------- Helpers ----------------
+def az(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, capture_output=True, text=True)
     if check and p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
@@ -71,9 +49,8 @@ def az_json(cmd: List[str], default: Any):
         return default
 
 def ensure_login():
-    az(["az","account","show","--only-show-errors"], check=False)
+    az(["az", "account", "show", "--only-show-errors"], check=False)
 
-# ---------------------- Normalize -----------------
 def normalize_type(s: str) -> str:
     if not s: return ""
     t = s.strip().lower()
@@ -81,43 +58,69 @@ def normalize_type(s: str) -> str:
     t = re.sub(r"/+", "/", t)
     return t
 
-# ---------------------- Support map (CSV) ---------
-def load_move_support_map_from_url(url: str, timeout: int = 30) -> Dict[str,bool]:
-    """
-    Loads the official move-support table from a CSV URL and returns:
-      { 'microsoft.provider/resourceType[/childType]' : True/False }
-    where value is Subscription column support (Yes/No).
-    """
-    logging.info(f"Downloading move-support CSV from: {url}")
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            text = resp.read().decode("utf-8", "replace").splitlines()
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Failed to download support CSV: {e}")
+def _pick_col(row, *candidates):
+    if not row: return None
+    keys = {k.lower(): k for k in row.keys()}
+    for c in candidates:
+        k = keys.get(c.lower())
+        if k: return k
+    return None
 
-    rdr = csv.DictReader(text)
-    mp: Dict[str,bool] = {}
+def load_move_support_map_from_url(url: str) -> Dict[str, bool]:
+    """
+    Reads move-support-resources-local.csv (your repo) into:
+      { 'microsoft.xxx/type[/child]' : True/False }   # Subscription support
+    Accepts flexible column names and 'Yes ...' variants.
+    """
+    with urllib.request.urlopen(url) as resp:
+        raw = resp.read()
+    text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    rdr = csv.DictReader(io.StringIO(text))
+
+    support: Dict[str, bool] = {}
     for row in rdr:
-        ns  = normalize_type(row.get("resourceProvider") or "")
-        rt  = normalize_type(row.get("resourceType") or "")
-        if not ns or not rt: 
+        if not row: 
             continue
-        key = f"{ns}/{rt}"
-        sub_ok = (row.get("subscription","").strip().lower().startswith("yes"))
-        mp[key] = sub_ok
-    if not mp:
-        raise RuntimeError("Support map is empty after parsing CSV.")
-    logging.info(f"Loaded {len(mp)} rows into support map.")
-    return mp
 
-# ---------------------- Offer / Owner -------------
+        col_ns  = _pick_col(row, "resourceProvider", "provider", "namespace", "rp")
+        col_rt  = _pick_col(row, "resourceType", "type", "resourcetype")
+        col_sub = _pick_col(row, "subscription", "subscription_move", "subscription support")
+
+        if not (col_ns and col_rt and col_sub):
+            # row missing required columns – skip
+            continue
+
+        ns  = normalize_type(row.get(col_ns, ""))
+        rt  = normalize_type(row.get(col_rt, ""))
+        sub = (row.get(col_sub, "") or "").strip().lower()
+
+        if not ns or not rt:
+            continue
+
+        key = f"{ns}/{rt}"
+        support[key] = sub.startswith("yes")  # handles "Yes - Basic", "Yes (template)" etc.
+
+    if not support:
+        raise RuntimeError("Support map is empty after parsing CSV.")
+    return support
+
+def load_move_support_map() -> Dict[str, bool]:
+    logging.info(f"Downloading move-support CSV from: {MOVE_SUPPORT_URL}")
+    return load_move_support_map_from_url(MOVE_SUPPORT_URL)
+
+# ---------------- Offer / Owner / Transferability ----------------
 def offer_from_quota(quota_id: str, authorization_source: str, has_mca_billing_link: bool) -> str:
     q = quota_id or ""
-    if any(x in q for x in ("MSDN","MS-AZR-0029P","MS-AZR-0062P","MS-AZR-0063P","VisualStudio","VS")): return "MSDN"
-    if q == "PayAsYouGo_2014-09-01" or any(x in q for x in ("MS-AZR-0003P","MS-AZR-0017P","MS-AZR-0023P")): return "Pay-As-You-Go"
-    if any(x in q for x in ("MS-AZR-0145P","MS-AZR-0148P","MS-AZR-0033P","MS-AZR-0034P")): return "EA"
-    if authorization_source == "ByPartner": return "CSP"
-    if has_mca_billing_link: return "MCA-online"
+    if any(x in q for x in ("MSDN","MS-AZR-0029P","MS-AZR-0062P","MS-AZR-0063P","VisualStudio","VS")):
+        return "MSDN"
+    if q == "PayAsYouGo_2014-09-01" or any(x in q for x in ("MS-AZR-0003P","MS-AZR-0017P","MS-AZR-0023P")):
+        return "Pay-As-You-Go"
+    if any(x in q for x in ("MS-AZR-0145P","MS-AZR-0148P","MS-AZR-0033P","MS-AZR-0034P")):
+        return "EA"
+    if authorization_source == "ByPartner":
+        return "CSP"
+    if has_mca_billing_link:
+        return "MCA-online"
     return MISSING
 
 def transferable_to_ea(offer: str) -> str:
@@ -135,12 +138,27 @@ def get_classic_account_admin_via_rest(sub_id: str) -> str:
         pass
     return ""
 
+def mca_billing_owner_for_sub(sub_id: str) -> str:
+    bsub = az_json(["az","billing","subscription","show","--subscription-id",sub_id,"-o","json"], {})
+    ba = bsub.get("billingAccountId"); bp = bsub.get("billingProfileId"); inv = bsub.get("invoiceSectionId")
+    scope=None
+    if ba and bp and inv: scope=f"/providers/Microsoft.Billing/billingAccounts/{ba}/billingProfiles/{bp}/invoiceSections/{inv}"
+    elif ba and bp:       scope=f"/providers/Microsoft.Billing/billingAccounts/{ba}/billingProfiles/{bp}"
+    elif ba:              scope=f"/providers/Microsoft.Billing/billingAccounts/{ba}"
+    if not scope: return ""
+    roles = az_json(["az","billing","role-assignment","list","--scope",scope,"-o","json"], [])
+    for r in roles:
+        if (r.get("roleDefinitionName") or "") == "Owner":
+            return r.get("principalEmail") or r.get("principalName") or r.get("signInName") or ""
+    return ""
+
 def resolve_owner(sub_id: str, offer: str) -> str:
     if offer in ("MSDN","Pay-As-You-Go","EA"):
         owner = get_classic_account_admin_via_rest(sub_id)
         return owner if owner else ("Check in EA portal - Account Owner" if offer=="EA" else "Check in Portal - classic subscription")
     if offer in ("MCA-online","MCA-E"):
-        return "Check in Billing (MCA)"
+        owner = mca_billing_owner_for_sub(sub_id)
+        return owner if owner else "Check in Billing (MCA)"
     if offer == "CSP":
         return "Managed by partner - CSP"
     return MISSING
@@ -149,14 +167,14 @@ def reason_for_non_transferable(offer: str, state: str, auth_src: str) -> Tuple[
     if state and state.lower()!="enabled":
         return ("DisabledSubscription","Subscription must be Active/Enabled before transfer.","Move prerequisites")
     if offer == "CSP":
-        return ("PartnerManagedNotDirectToEA","CSP → EA requires manual resource move (no direct billing transfer).","Move resources guidance")
+        return ("PartnerManagedNotDirectToEA","CSP → EA isn’t an automatic billing transfer; requires manual resource move.","Move resources guidance")
     if offer in ("MCA-online","MCA-E"):
-        return ("ManualResourceMoveRequired","MCA → EA transfer unsupported; move resources into EA subscription.","Move resources guidance")
+        return ("ManualResourceMoveRequired","MCA → EA direct billing transfer isn’t supported; move resources into EA subscription.","Move resources guidance")
     if offer in ("MSDN", MISSING):
-        return ("NotSupportedOffer","Dev/Test or classic/unknown offer unsupported for direct EA transfer.","Transfer matrix")
+        return ("NotSupportedOffer","Dev/Test or classic/unknown offer isn’t supported for a direct EA transfer.","Transfer matrix")
     return ("Unknown","Insufficient data to determine blocking reason.","Check tenant/offer/permissions")
 
-# ---------------------- Inventory (live) ----------
+# ---------------- Inventory & validation ----------------
 def list_rgs(sub_id: str) -> List[str]:
     rgs = az_json(["az","group","list","--subscription",sub_id,"-o","json"], [])
     return [rg.get("name") for rg in rgs if rg.get("name")]
@@ -178,7 +196,7 @@ def list_resources_by_rg(subscription_id: str) -> Dict[str,List[str]]:
         if rg and rid: grouped.setdefault(rg, []).append(rid)
     return grouped
 
-def pick_intrasub_target_rg(src_rg: str, all_rgs: List[str]) -> str:
+def pick_intrasub_target_rg(sub_id: str, src_rg: str, all_rgs: List[str]) -> str:
     candidates = [r for r in all_rgs if r and r.lower()!=src_rg.lower()]
     if not candidates: return ""
     for pref in ("migr","target","transit","move"):
@@ -196,8 +214,13 @@ def validate_move_resources(source_sub: str, rg: str, resource_ids: List[str], t
         except Exception: return {}
     return {"error":{"code":"ValidationFailed","message": err or "Validation failed"}}
 
-# ---------------------- Parse IDs -----------------
+# ---------------- Parse types & classification ----------------
 def parse_types(resource_id: str):
+    """
+    Returns: is_child, top_level_type, full_type, parent_id, parent_type
+    ex: .../providers/Microsoft.Web/sites/myapp/slots/stage
+        top = microsoft.web/sites, full = microsoft.web/sites/slots
+    """
     m = re.search(r"/providers/([^/]+)/([^/]+)(/.*)?", resource_id, re.IGNORECASE)
     if not m:
         return False, None, None, None, None
@@ -215,7 +238,6 @@ def parse_types(resource_id: str):
         parent_id = re.sub(r"(/providers/[^/]+/[^/]+/[^/]+).*", r"\1", resource_id, flags=re.IGNORECASE)
     return is_child, top_type, full_type, parent_id, parent_type
 
-# ---------------------- Classifier ----------------
 def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]:
     is_child, top_type, full_type, parent_id, parent_type = parse_types(resource_id)
     top_ok  = support.get(top_type or "", None)
@@ -225,7 +247,7 @@ def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]
     if this_ok is None:
         return {
             "BlockerCategory": "Unknown",
-            "Why": "Resource type not found in official move-support table (Subscription column).",
+            "Why": "Resource type not found in official move-support table (subscription column). Review manually.",
             "DocRef": "move-support",
             "ResourceType": (full_type or top_type or ""),
             "IsChild": "Yes" if is_child else "No",
@@ -246,12 +268,12 @@ def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]
             }
         return {}  # OK
 
-    # this_ok == False
+    # Not supported
     if is_child:
         if top_ok is True:
             return {
                 "BlockerCategory":"UnsupportedChildTypeCannotMove",
-                "Why":"Child type doesn’t support subscription move although parent does.",
+                "Why":"Child resource type doesn’t support subscription move although parent does.",
                 "DocRef":"move-support",
                 "ResourceType": full_type or top_type or "",
                 "IsChild":"Yes",
@@ -279,54 +301,53 @@ def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]
             "ParentType":"",
         }
 
+# ---------------- ARM error mapping ----------------
 def blocker_from_arm_error(err: Dict[str,Any]) -> Tuple[str,str,str]:
     m = json.dumps(err, ensure_ascii=False).lower()
     if "requestdisallowedbypolicy" in m or " policy" in m:
         if "tag" in m and "owner" in m and "email" in m:
-            return ("PolicyBlocked","Required 'owner' tag with valid email (possibly specific domain).","Align tags/policy and re-validate")
-        return ("PolicyBlocked","Blocked by Azure Policy on source/target.","Align policy and re-validate")
+            return ("PolicyBlocked","Required 'owner' tag with valid email (may require specific domain).","Align tags/policy and re-validate")
+        return ("PolicyBlocked","Blocked by Azure Policy on source/target RG or subscription.","Align policy and re-validate")
     if "lock" in m or "readonly" in m:
-        return ("ResourceLockPresent","Read-only lock on source/target RG/subscription.","Remove lock before move")
+        return ("ResourceLockPresent","Read-only lock on source or destination RG/subscription.","Remove lock before move")
     if ("not registered for a resource type" in m) or ("provider" in m and "register" in m):
-        return ("ProviderRegistrationMissing","Target subscription missing provider registration.","Register provider in target subscription")
+        return ("ProviderRegistrationMissing","Destination subscription missing required Resource Provider registration.","Register provider in target subscription")
     if "authorization" in m or "not permitted" in m or "insufficient privileges" in m or "denyassignment" in m:
-        return ("InsufficientPermissions","Caller lacks required permissions.","Ensure moveResources on source RG + write on target RG")
+        return ("InsufficientPermissions","Caller lacks required permissions on source/destination.","Ensure moveResources on source RG + write on target RG")
     if "child" in m and "parent" in m:
         return ("CrossRGParentChildDependency","Child must move with its parent (or vice versa).","Move together / unify RG first")
     if "cannot be moved" in m or "is not supported for move" in m:
-        return ("UnsupportedResourceType","Type/SKU not supported for move.","See move-support table")
-    return ("ValidationFailed","Generic validation failure; check details JSON.","See ARM docs")
+        return ("UnsupportedResourceType","Resource type/SKU isn’t supported for move.","See move-support table")
+    return ("ValidationFailed","Azure returned a validation failure. Inspect details JSON.","See ARM move guidance")
 
-# ---------------------- Main ----------------------
+# ---------------- Main ----------------
 def main():
-    args = parse_args()
-    setup_logging(args.quiet)
-
-    # 1) Load move-support table from GitHub raw CSV
-    support_map = load_move_support_map_from_url(args.support_url)
-
-    # 2) Ensure az login
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     ensure_login()
 
-    # 3) Output files
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_discovery = f"azure_env_discovery_{ts}.csv"
-    out_reasons   = f"non_transferable_reasons_{ts}.csv"
-    out_blockers  = f"blockers_details_{ts}.csv"
+    # Load support table (CSV from your repo)
+    support_map = load_move_support_map()
+    logging.info(f"Loaded {len(support_map)} resource-type rows into support map.")
 
     headers_discovery = ["Subscription ID","Sub. Type","Sub. Owner","Transferable (Internal)"]
     headers_reasons   = ["Subscription ID","Sub. Type","ReasonCode","Why","DocRef"]
     headers_blockers  = ["SubscriptionId","ResourceGroup","ResourceId","ResourceType","IsChild","ParentId","ParentType","BlockerCategory","Why","DocRef"]
 
-    rows_discovery=[]; rows_reasons=[]; non_transferable_subs: List[str] = []
-
-    # 4) Discovery per subscription
     subs = az_json(["az","account","list","--all","-o","json"], [])
     billing_accounts = az_json(["az","billing","account","list","-o","json"], [])
     overall_agreement = ""
     try: overall_agreement = (billing_accounts[0].get("agreementType") or "")
     except Exception: pass
 
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_discovery = f"azure_env_discovery_{ts}.csv"
+    out_reasons   = f"non_transferable_reasons_{ts}.csv"
+    out_blockers  = f"blockers_details_{ts}.csv"
+
+    rows_discovery=[]; rows_reasons=[]
+    non_transferable_subs: List[str] = []
+
+    # ---- Stage 1: discovery ----
     for s in subs:
         sub_id = s.get("id",""); state = s.get("state","")
         if not sub_id: continue
@@ -336,7 +357,7 @@ def main():
         quota_id = arm.get("subscriptionPolicies",{}).get("quotaId","") if not has_err else ""
         auth_src = arm.get("authorizationSource","") if not has_err else ""
         bsub = az_json(["az","billing","subscription","show","--subscription-id",sub_id,"-o","json"], {})
-        has_mca = bool(bsub.get("billingAccountId")) if bsub else ("MicrosoftCustomerAgreement" in (overall_agreement or ""))
+        has_mca = bool(bsub.get("billingAccountId")) if bsub else ("MicrosoftCustomerAgreement" in overall_agreement)
 
         offer = offer_from_quota(quota_id, auth_src, has_mca)
         owner = resolve_owner(sub_id, offer)
@@ -356,26 +377,28 @@ def main():
     print(f"✅ Discovery CSV: {out_discovery}")
     print(f"✅ Reasons   CSV: {out_reasons}")
 
-    # 5) Blockers (only for non-transferable subs)
+    # ---- Stage 2: blockers ----
     blockers_rows: List[List[str]] = []
+
     for sub_id in non_transferable_subs:
         all_rgs = list_rgs(sub_id)
+        if not all_rgs:
+            logging.info(f"Skipping blockers for {sub_id}: no resource groups.")
+            continue
+
         grouped = list_resources_by_rg(sub_id)
         if not grouped:
             logging.info(f"Skipping blockers for {sub_id}: no resources.")
             continue
+
         for src_rg, ids in grouped.items():
-            tgt_rg = pick_intrasub_target_rg(src_rg, all_rgs)
+            tgt_rg = pick_intrasub_target_rg(sub_id, src_rg, all_rgs)
             if not tgt_rg:
                 logging.info(f"Skipping RG '{src_rg}' in {sub_id}: no alternate target RG exists.")
                 continue
             target_rg_id = f"/subscriptions/{sub_id}/resourceGroups/{tgt_rg}"
 
-            # Optional validateMoveResources (can be skipped via --no-validate)
-            if args.no_validate:
-                result = {}
-            else:
-                result = validate_move_resources(sub_id, src_rg, ids, target_rg_id)
+            result = validate_move_resources(sub_id, src_rg, ids, target_rg_id)
 
             if isinstance(result, dict) and "error" in result:
                 cat, why, doc = blocker_from_arm_error(result["error"])
@@ -402,7 +425,7 @@ def main():
             w=csv.writer(f); w.writerow(headers_blockers); w.writerows(blockers_rows)
         print(f"🔎 Blockers CSV: {out_blockers}")
     else:
-        print("🔎 Blockers scan: none detected (validateMoveResources + move-support table).")
+        print("🔎 Blockers scan: none detected (validateMoveResources + official move-support table).")
 
 if __name__ == "__main__":
     main()

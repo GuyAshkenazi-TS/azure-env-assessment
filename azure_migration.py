@@ -127,32 +127,49 @@ def _parse_md_table_to_dicts(md_lines: List[str]) -> List[Dict[str,str]]:
 def load_move_support_map_from_md(url: str) -> Dict[str, bool]:
     text = _open_url_or_file(url)
     support: Dict[str,bool] = {}
+
+    def _contains(h: str, needle: str) -> bool:
+        return needle in h.strip().lower()
+
     for t in _parse_md_tables(text):
         rows = _parse_md_table_to_dicts(t)
         if not rows:
             continue
+
         headers = list(rows[0].keys())
-        has_sub = any(h.strip().lower() == "subscription" for h in headers)
-        has_provider = any(h.strip().lower() in ("resourceprovider","provider","namespace","rp") for h in headers)
-        has_type = any(h.strip().lower() in ("resourcetype","type","resourcetype(s)") for h in headers)
+        # היה כאן == "subscription" – מחליפים ל-"subscription" in header
+        has_sub = any(_contains(h, "subscription") for h in headers)
+        has_provider = any(_contains(h, "resourceprovider") or _contains(h, "provider") or _contains(h, "namespace") or _contains(h, "rp") for h in headers)
+        has_type = any(_contains(h, "resourcetype") or _contains(h, "resourcetype(s)") or _contains(h, "type") for h in headers)
         if not (has_sub and has_provider and has_type):
             continue
+
         for r in rows:
-            col_ns  = _pick_col(r, "resourceProvider","provider","namespace","rp")
-            col_rt  = _pick_col(r, "resourceType","type","resourcetype","resourcetype(s)")
-            col_sub = _pick_col(r, "subscription","subscription support","subscription_move")
-            ns  = _normalize_type(r.get(col_ns, ""))
-            rt  = _normalize_type(r.get(col_rt, ""))
-            sub = (r.get(col_sub, "") or "").strip().lower()
+            # זיהוי עמודות גמיש יותר
+            col_ns_candidates  = ("resourceProvider","provider","namespace","rp","Resource provider")
+            col_rt_candidates  = ("resourceType","resourcetype","resourcetype(s)","type","Resource type","Resource type(s)")
+            col_sub_candidates = ("subscription","subscription support","subscription_move","subscription move support")
+
+            col_ns  = _pick_col(r, *col_ns_candidates)
+            col_rt  = _pick_col(r, *col_rt_candidates)
+            col_sub = _pick_col(r, *col_sub_candidates)
+
+            ns  = _normalize_type(r.get(col_ns, "") if col_ns else "")
+            rt  = _normalize_type(r.get(col_rt, "") if col_rt else "")
+            sub = (r.get(col_sub, "") if col_sub else "").strip().lower()
+
             if not ns or not rt:
                 continue
+
             key = f"{ns}/{rt}"
-            # Accept "Yes", "Yes - Basic", "Yes (preview)" etc.
+            # תומך ב-"Yes", "Yes -", "Yes (" וכו'
             support[key] = sub.startswith("yes")
+
         if support:
             break
+
     if not support:
-        raise RuntimeError("Failed to parse move-support table from Markdown (no matching table with Subscription column).")
+        raise RuntimeError("Failed to parse move-support table from Markdown (no matching table with Subscription-like column).")
     return support
 
 def load_move_support_map_from_csv(url: str) -> Dict[str, bool]:

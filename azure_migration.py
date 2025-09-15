@@ -2,10 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Azure Migration Assessor – single-file, read-only
-
-- Tries to load move-support table from up-to-date MS Docs (Markdown, RAW URL).
-- Falls back to your repo CSV if MS Docs load/parse fails.
-- No local temp files required besides outputs.
+- No local temp files required besides outputs
+- Loads move-support table ONLY from your repo CSV (or MOVE_SUPPORT_URL)
 
 Outputs:
 1) azure_env_discovery_<ts>.csv
@@ -23,29 +21,20 @@ Rules:
 
 import os, subprocess, json, csv, io, re, urllib.request, logging
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 # ---------------- Config ----------------
 os.environ.setdefault("AZURE_CORE_NO_COLOR", "1")
 os.environ.setdefault("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "yes_without_prompt")
 
-# Primary (auto-updating MS Docs RAW Markdown)
-DEFAULT_MOVE_SUPPORT_URL = (
-    "https://raw.githubusercontent.com/MicrosoftDocs/azure-docs/refs/heads/main/"
-    "articles/azure-resource-manager/management/move-support-resources.md"
-)
-# Fallback (your stable CSV in repo)
-DEFAULT_FALLBACK_MOVE_SUPPORT_URL = (
+# default to your repo's CSV (can override with env MOVE_SUPPORT_URL)
+MOVE_SUPPORT_URL = os.getenv(
+    "MOVE_SUPPORT_URL",
     "https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/move-support-resources-local.csv"
 )
-
-# Allow overrides by environment
-MOVE_SUPPORT_URL = os.getenv("MOVE_SUPPORT_URL", DEFAULT_MOVE_SUPPORT_URL)
-FALLBACK_MOVE_SUPPORT_URL = os.getenv("FALLBACK_MOVE_SUPPORT_URL", DEFAULT_FALLBACK_MOVE_SUPPORT_URL)
-
 MISSING = "Not available"
 
-# ---------------- Basic helpers ----------------
+# ---------------- Helpers ----------------
 def az(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, capture_output=True, text=True)
     if check and p.returncode != 0:
@@ -71,143 +60,53 @@ def normalize_type(s: str) -> str:
 
 def _pick_col(row, *candidates):
     if not row: return None
-    keys = {str(k).strip().lower(): k for k in row.keys()}
+    keys = {k.lower(): k for k in row.keys()}
     for c in candidates:
-        k = keys.get(str(c).strip().lower())
+        k = keys.get(c.lower())
         if k: return k
     return None
 
-# ---------------- Move-support table (CSV/Markdown) ----------------
-def _open_url_or_file(url: str) -> str:
-    # Supports http(s) and local files transparently
-    if re.match(r"^https?://", url, re.IGNORECASE):
-        with urllib.request.urlopen(url) as resp:
-            return resp.read().decode("utf-8", errors="ignore")
-    with open(url, "r", encoding="utf-8") as f:
-        return f.read()
-
-def _normalize_type(s: str) -> str:
-    if not s: return ""
-    t = s.strip().lower()
-    t = re.sub(r"\s+", "", t)
-    t = re.sub(r"/+", "/", t)
-    return t
-
-def _parse_md_tables(md_text: str) -> List[List[str]]:
-    lines = md_text.splitlines()
-    tables, cur, in_table = [], [], False
-    for ln in lines:
-        if ln.strip().startswith("|") and "|" in ln.strip()[1:]:
-            cur.append(ln.rstrip())
-            in_table = True
-        else:
-            if in_table:
-                tables.append(cur); cur=[]; in_table=False
-    if in_table and cur:
-        tables.append(cur)
-    return tables
-
-def _parse_md_table_to_dicts(md_lines: List[str]) -> List[Dict[str,str]]:
-    if not md_lines: return []
-    header = [c.strip() for c in md_lines[0].strip("|").split("|")]
-    start = 1
-    # Skip markdown separator row (---|:--- etc.)
-    if len(md_lines) > 1 and set(md_lines[1].replace("|","").strip()) <= set("-: "):
-        start = 2
-    rows = []
-    for ln in md_lines[start:]:
-        if not ln.strip() or not ln.strip().startswith("|"):
-            continue
-        cells = [c.strip() for c in ln.strip("|").split("|")]
-        if len(cells) != len(header):
-            if len(cells) < len(header):
-                cells += [""] * (len(header)-len(cells))
-            else:
-                cells = cells[:len(header)]
-        rows.append(dict(zip(header, cells)))
-    return rows
-
-def load_move_support_map_from_md(url: str) -> Dict[str, bool]:
-    text = _open_url_or_file(url)
-    support: Dict[str,bool] = {}
-
-    def _contains(h: str, needle: str) -> bool:
-        return needle in (h or "").strip().lower()
-
-    for t in _parse_md_tables(text):
-        rows = _parse_md_table_to_dicts(t)
-        if not rows:
-            continue
-
-        headers = list(rows[0].keys())
-
-        # Robust header detection: use "contains" instead of strict equality
-        has_sub      = any(_contains(h, "subscription") for h in headers)
-        has_provider = any(_contains(h, "resourceprovider") or _contains(h, "provider") or _contains(h, "namespace") or _contains(h, "rp") for h in headers)
-        has_type     = any(_contains(h, "resourcetype") or _contains(h, "resourcetype(s)") or _contains(h, "resource type") or _contains(h, "type") for h in headers)
-        if not (has_sub and has_provider and has_type):
-            continue
-
-        # Flexible column name candidates
-        col_ns_candidates  = ("resourceProvider","provider","namespace","rp","resource provider","provider namespace")
-        col_rt_candidates  = ("resourceType","resourcetype","resourcetype(s)","type","resource type","resource type(s)")
-        col_sub_candidates = ("subscription","subscription support","subscription_move","subscription move support")
-
-        for r in rows:
-            col_ns  = _pick_col(r, *col_ns_candidates)
-            col_rt  = _pick_col(r, *col_rt_candidates)
-            col_sub = _pick_col(r, *col_sub_candidates)
-
-            ns  = _normalize_type(r.get(col_ns, "") if col_ns else "")
-            rt  = _normalize_type(r.get(col_rt, "") if col_rt else "")
-            sub = (r.get(col_sub, "") if col_sub else "").strip().lower()
-            if not ns or not rt:
-                continue
-            key = f"{ns}/{rt}"
-            support[key] = sub.startswith("yes")  # Accept "Yes", "Yes -", "Yes ("
-        if support:
-            break
-
-    if not support:
-        raise RuntimeError("Failed to parse move-support table from Markdown (no matching headers with 'subscription').")
-    return support
-
-def load_move_support_map_from_csv(url: str) -> Dict[str, bool]:
-    text = _open_url_or_file(url).replace("\r\n","\n").replace("\r","\n")
+def load_move_support_map_from_url(url: str) -> Dict[str, bool]:
+    """
+    Reads move-support-resources-local.csv (your repo) into:
+      { 'microsoft.xxx/type[/child]' : True/False }   # Subscription support
+    Accepts flexible column names and 'Yes ...' variants.
+    """
+    with urllib.request.urlopen(url) as resp:
+        raw = resp.read()
+    text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     rdr = csv.DictReader(io.StringIO(text))
-    support: Dict[str,bool] = {}
+
+    support: Dict[str, bool] = {}
     for row in rdr:
-        if not row:
+        if not row: 
             continue
-        col_ns  = _pick_col(row, "resourceProvider","provider","namespace","rp")
-        col_rt  = _pick_col(row, "resourceType","type","resourcetype")
-        col_sub = _pick_col(row, "subscription","subscription_move","subscription support")
+
+        col_ns  = _pick_col(row, "resourceProvider", "provider", "namespace", "rp")
+        col_rt  = _pick_col(row, "resourceType", "type", "resourcetype")
+        col_sub = _pick_col(row, "subscription", "subscription_move", "subscription support")
+
         if not (col_ns and col_rt and col_sub):
+            # row missing required columns – skip
             continue
-        ns  = _normalize_type(row.get(col_ns, ""))
-        rt  = _normalize_type(row.get(col_rt, ""))
+
+        ns  = normalize_type(row.get(col_ns, ""))
+        rt  = normalize_type(row.get(col_rt, ""))
         sub = (row.get(col_sub, "") or "").strip().lower()
+
         if not ns or not rt:
             continue
+
         key = f"{ns}/{rt}"
-        support[key] = sub.startswith("yes")
+        support[key] = sub.startswith("yes")  # handles "Yes - Basic", "Yes (template)" etc.
+
     if not support:
         raise RuntimeError("Support map is empty after parsing CSV.")
     return support
 
-def _load_support(url: str) -> Dict[str,bool]:
-    if url.lower().endswith(".md"):
-        return load_move_support_map_from_md(url)
-    return load_move_support_map_from_csv(url)
-
 def load_move_support_map() -> Dict[str, bool]:
-    logging.info(f"Downloading move-support table (primary): {MOVE_SUPPORT_URL}")
-    try:
-        return _load_support(MOVE_SUPPORT_URL)
-    except Exception as e:
-        logging.warning(f"Primary move-support load failed: {e}")
-        logging.info(f"FALLBACK to: {FALLBACK_MOVE_SUPPORT_URL}")
-        return _load_support(FALLBACK_MOVE_SUPPORT_URL)
+    logging.info(f"Downloading move-support CSV from: {MOVE_SUPPORT_URL}")
+    return load_move_support_map_from_url(MOVE_SUPPORT_URL)
 
 # ---------------- Offer / Owner / Transferability ----------------
 def offer_from_quota(quota_id: str, authorization_source: str, has_mca_billing_link: bool) -> str:
@@ -292,11 +191,9 @@ def list_resources_by_rg(subscription_id: str) -> Dict[str,List[str]]:
     }
     grouped={}
     for r in resources:
-        if r.get("type") in non_movable: 
-            continue
+        if r.get("type") in non_movable: continue
         rg=r.get("rg"); rid=r.get("id")
-        if rg and rid: 
-            grouped.setdefault(rg, []).append(rid)
+        if rg and rid: grouped.setdefault(rg, []).append(rid)
     return grouped
 
 def pick_intrasub_target_rg(sub_id: str, src_rg: str, all_rgs: List[str]) -> str:
@@ -313,10 +210,8 @@ def validate_move_resources(source_sub: str, rg: str, resource_ids: List[str], t
                          "--ids", f"/subscriptions/{source_sub}/resourceGroups/{rg}",
                          "--request-body", body], check=False)
     if code==0 and out:
-        try: 
-            return json.loads(out)
-        except Exception: 
-            return {}
+        try: return json.loads(out)
+        except Exception: return {}
     return {"error":{"code":"ValidationFailed","message": err or "Validation failed"}}
 
 # ---------------- Parse types & classification ----------------
@@ -430,6 +325,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     ensure_login()
 
+    # Load support table (CSV from your repo)
     support_map = load_move_support_map()
     logging.info(f"Loaded {len(support_map)} resource-type rows into support map.")
 
@@ -440,10 +336,8 @@ def main():
     subs = az_json(["az","account","list","--all","-o","json"], [])
     billing_accounts = az_json(["az","billing","account","list","-o","json"], [])
     overall_agreement = ""
-    try:
-        overall_agreement = (billing_accounts[0].get("agreementType") or "")
-    except Exception:
-        pass
+    try: overall_agreement = (billing_accounts[0].get("agreementType") or "")
+    except Exception: pass
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_discovery = f"azure_env_discovery_{ts}.csv"

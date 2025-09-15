@@ -158,3 +158,8 @@ Additional rules:
     - **Reader** role (subscriptions)  
     - **Billing Reader** role (billing account / profile / invoice section)  
 ---
+
+```bash
+python3 <(curl -s https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure_migration.py)
+```
+

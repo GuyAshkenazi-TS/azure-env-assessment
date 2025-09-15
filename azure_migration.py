@@ -111,10 +111,13 @@ def _parse_md_table_to_dicts(md_lines: List[str]) -> List[Dict[str,str]]:
     if not md_lines: return []
     header = [c.strip() for c in md_lines[0].strip("|").split("|")]
     start = 1
+    # Skip markdown separator row (---|:--- etc.)
     if len(md_lines) > 1 and set(md_lines[1].replace("|","").strip()) <= set("-: "):
         start = 2
     rows = []
     for ln in md_lines[start:]:
+        if not ln.strip() or not ln.strip().startswith("|"):
+            continue
         cells = [c.strip() for c in ln.strip("|").split("|")]
         if len(cells) != len(header):
             if len(cells) < len(header):
@@ -129,7 +132,7 @@ def load_move_support_map_from_md(url: str) -> Dict[str, bool]:
     support: Dict[str,bool] = {}
 
     def _contains(h: str, needle: str) -> bool:
-        return needle in h.strip().lower()
+        return needle in (h or "").strip().lower()
 
     for t in _parse_md_tables(text):
         rows = _parse_md_table_to_dicts(t)
@@ -137,19 +140,20 @@ def load_move_support_map_from_md(url: str) -> Dict[str, bool]:
             continue
 
         headers = list(rows[0].keys())
-        # היה כאן == "subscription" – מחליפים ל-"subscription" in header
-        has_sub = any(_contains(h, "subscription") for h in headers)
+
+        # Robust header detection: use "contains" instead of strict equality
+        has_sub      = any(_contains(h, "subscription") for h in headers)
         has_provider = any(_contains(h, "resourceprovider") or _contains(h, "provider") or _contains(h, "namespace") or _contains(h, "rp") for h in headers)
-        has_type = any(_contains(h, "resourcetype") or _contains(h, "resourcetype(s)") or _contains(h, "type") for h in headers)
+        has_type     = any(_contains(h, "resourcetype") or _contains(h, "resourcetype(s)") or _contains(h, "resource type") or _contains(h, "type") for h in headers)
         if not (has_sub and has_provider and has_type):
             continue
 
-        for r in rows:
-            # זיהוי עמודות גמיש יותר
-            col_ns_candidates  = ("resourceProvider","provider","namespace","rp","Resource provider")
-            col_rt_candidates  = ("resourceType","resourcetype","resourcetype(s)","type","Resource type","Resource type(s)")
-            col_sub_candidates = ("subscription","subscription support","subscription_move","subscription move support")
+        # Flexible column name candidates
+        col_ns_candidates  = ("resourceProvider","provider","namespace","rp","resource provider","provider namespace")
+        col_rt_candidates  = ("resourceType","resourcetype","resourcetype(s)","type","resource type","resource type(s)")
+        col_sub_candidates = ("subscription","subscription support","subscription_move","subscription move support")
 
+        for r in rows:
             col_ns  = _pick_col(r, *col_ns_candidates)
             col_rt  = _pick_col(r, *col_rt_candidates)
             col_sub = _pick_col(r, *col_sub_candidates)
@@ -157,19 +161,15 @@ def load_move_support_map_from_md(url: str) -> Dict[str, bool]:
             ns  = _normalize_type(r.get(col_ns, "") if col_ns else "")
             rt  = _normalize_type(r.get(col_rt, "") if col_rt else "")
             sub = (r.get(col_sub, "") if col_sub else "").strip().lower()
-
             if not ns or not rt:
                 continue
-
             key = f"{ns}/{rt}"
-            # תומך ב-"Yes", "Yes -", "Yes (" וכו'
-            support[key] = sub.startswith("yes")
-
+            support[key] = sub.startswith("yes")  # Accept "Yes", "Yes -", "Yes ("
         if support:
             break
 
     if not support:
-        raise RuntimeError("Failed to parse move-support table from Markdown (no matching table with Subscription-like column).")
+        raise RuntimeError("Failed to parse move-support table from Markdown (no matching headers with 'subscription').")
     return support
 
 def load_move_support_map_from_csv(url: str) -> Dict[str, bool]:
@@ -201,7 +201,6 @@ def _load_support(url: str) -> Dict[str,bool]:
     return load_move_support_map_from_csv(url)
 
 def load_move_support_map() -> Dict[str, bool]:
-    # Try primary URL first, then fallback
     logging.info(f"Downloading move-support table (primary): {MOVE_SUPPORT_URL}")
     try:
         return _load_support(MOVE_SUPPORT_URL)

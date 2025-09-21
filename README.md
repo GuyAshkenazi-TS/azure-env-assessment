@@ -1,132 +1,123 @@
 # Azure Environment Assessment
 
 ## 🎯 Purpose
-This script collects **high-level information** about your Azure environment so we can quickly understand **who owns what** and **what type of subscriptions** you run—without touching any resources.
+This project provides a **safe, read-only assessment** of your Azure environment.  
+It runs in **two lightweight stages** so you can quickly understand:
 
-It identifies:
+- Which **subscriptions** exist in your tenant
+- Each subscription’s **type** (MSDN, Pay-As-You-Go, EA, MCA, CSP)
+- Who the **owner** is (Account Admin, Billing Owner, or Partner-managed)
+- Whether the subscription is **transferable** to an EA
+- Which **resources** are supported / not supported for move between subscriptions
 
-- **Tenant & subscriptions** (IDs and states)
-- **Subscription type (Offer)** – e.g., **MSDN**, **Pay-As-You-Go (MOSP)**, **EA**, **MCA**, **CSP**
-- **Owner**:
-  - **Classic subscriptions (MSDN / PAYG / legacy EA):** returns the **Account Admin** (when visible via API) or tells you exactly where to check in the portal
-  - **MCA:** returns **Billing Owner** if you have Billing Reader; otherwise guidance
-  - **CSP:** marks as partner-managed
-- **Transferable (Internal)** – quick Yes/No per Microsoft’s rules for transferring to **EA**
-
-> ✅ The script is **READ-ONLY**. It does not modify or delete anything.
+> ✅ Both Stage-1 and Stage-2 are **read-only**.  
+> They do not create, modify, or delete anything.
 
 ---
 
 ## ✅ Prerequisites
 
-For best results, make sure your user has:
+To run the scripts successfully, make sure your user has:
 
-- **Reader** on the subscriptions you want to map  
-- **Billing Reader** on the relevant **Billing Account / Billing Profile** (for MCA ownership)  
-- (Optional) Access to classic info improves “Account Admin” retrieval on **MSDN / PAYG / legacy EA**
+- **Reader** role on the subscriptions you want to scan  
+- **Billing Reader** role on the relevant Billing Account / Profile (for MCA ownership)  
+- (Optional) Classic access improves Account Admin detection on **MSDN / PAYG / legacy EA**
 
 ---
 
 ## 🚀 How to Run
 
-1. **Open the correct Azure Directory**  
-   - Go to the Azure Portal.  
-   - On the top-right, click **Directory + Subscription** and switch to the correct tenant (organization).
+### Step 1 – Open the correct Azure Directory
+1. Go to the [Azure Portal](https://portal.azure.com).  
+2. On the top-right, click **Directory + Subscription** and switch to the correct tenant.
 
-2. **Launch Azure Cloud Shell (Bash)**  
-   - Click on the Cloud Shell icon in the top bar of the portal.  
-   - Select **Bash** as the environment.  
-   ![Bash](S-Screenshots/Bash.png)
+### Step 2 – Launch Cloud Shell (Bash)
+- Click the **Cloud Shell** icon in the top bar.  
+- Select **Bash**.  
+  ![Bash](S-Screenshots/Bash.png)
 
-3. **Run the script**  
-   Copy and paste the following command:
+### Step 3 – Run Stage-1 (Subscription Discovery)
 
-   ```bash
-   bash -c "$(curl -fsSL https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure-env-assessment.sh)"
-   ```
+Copy and paste:
 
-The script will execute and generate the output files directly in your Cloud Shell home directory.
-
-That’s it — you’ll get the CSV output ready to download.
-![Example](S-Screenshots/Example3.png)
-
----
-
-📂 Output Files
-
-After running, you will find:
-	•	azure_env_discovery_<timestamp>.csv → Excel-friendly table
----
-
-📥 How to Download the Files
-
-Download via Cloud Shell GUI
-
-	•	In the Cloud Shell window, click the Download/Upload icon (📂⬇️).
-	•	Select Download and choose your CSV file.
-   ![Manage Files](S-Screenshots/Manage-Files.png)
-
-   ![Download Files](S-Screenshots/Download.png)
-
-![Download Files](S-Screenshots/Download_File.png)
-
-
-📤 How to Send Back the Files
-	
- 	•	Download the CSV file to your local machine (see above).
- 	•	Send them back via email, Teams, or any other secure channel you prefer.
-
----
-
-![CSV](S-Screenshots/CSV3.png)
-
-## 🧾 CSV Columns (what you’ll see)
-
-| Column                  | What it means                                                                 |
-|--------------------------|-------------------------------------------------------------------------------|
-| **Subscription ID**      | The subscription GUID                                                        |
-| **Sub. Type**            | Offer classification: **MSDN**, **Pay-As-You-Go**, **EA**, **MCA-online**, **CSP**, or **Not available** (no API access) |
-| **Sub. Owner**           | One of: Account Admin email (classic), Billing Owner email (MCA, if permitted), or clear guidance like:<br> → *“Check in Portal – classic subscription”*<br> → *“Check in Billing (MCA)”*<br> → *“Managed by partner – CSP”* |
-| **Transferable (Internal)** | **Yes** for EA and Pay-As-You-Go, otherwise **No** (per Microsoft transfer matrix) |
-
-
-⚡ Quick Start (for advanced users)
-
-If you are already in the correct tenant and Cloud Shell (Bash), just run:
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure-env-assessment.sh)"
-```
+python3 <(curl -s https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/azure_assess_stage1.py)
+   ```
+## What Stage-1 does
+- Scans all subscriptions in the tenant  
+- Produces a single CSV with high-level info  
+- Prints ready-to-copy Stage-2 commands for each subscription  
 
+---
+
+## Step 4 – Run Stage-2 (Per Subscription Resource Scan)
+For each subscription, Stage-1 will print a command like:
+
+![Stage1_Outputs](S-Screenshots/Stage1_Outputs.png)
+
+Run these one by one, or in **parallel terminals** for large subscriptions.  
+
+---
+
+## 📂 Output Files
+
+### Stage-1
+- `subscriptions_discovery_<timestamp>.csv` – High-level list of all subscriptions  
+![First_CSV](S-Screenshots/First_CSV.png)
+
+### Stage-2 (per subscription)
+- `resources_support_matrix_<SUB>_<timestamp>.csv` – All resources in the subscription with **Yes / No / Not in table** support status  
+- `blockers_details_<SUB>_<timestamp>.csv` – Only the unsupported / not-in-table resources (blockers)  
+![Second_CSV](S-Screenshots/Second_CSV.png)
+
+> The script will generate these files directly in your Cloud Shell home directory.
+
+---
+
+## 📥 How to Download the Files
+Download via Cloud Shell GUI:
+
+1. In the Cloud Shell window, click the **Download/Upload** icon (📂⬇️).  
+2. Select **Download** and choose your CSV file.  
+
+![Manage Files](S-Screenshots/Manage-Files.png)  
+![Download Files](S-Screenshots/Download.png)  
+![Download Files](S-Screenshots/Download_File.png)  
+
+---
+
+## 📤 How to Send Back the Files
+- Download the CSV file to your local machine (see above).  
+- Send them back via email, Teams, or any other secure channel you prefer.  
+
+---
 
 ## 🧭 When the CSV Says “Check in Portal” – What to Do
-
 Sometimes the **Account Admin** isn’t retrievable via API (common with **MSDN**, **Pay-As-You-Go**, or legacy **EA**).  
 If the **Sub. Owner** column shows:  
 
 - *“Check in Portal – classic subscription”*  
 - *“Check in EA portal – Account Owner”*  
 
----
 👉 If you see one of these in the **CSV output**, follow the steps below to get the information manually.
 
 ---
 
 ## Step-by-Step Instructions
-
 1. Sign in to the [Azure Portal](https://portal.azure.com).  
 2. In the left-hand menu, go to **Subscriptions**.  
-3. Select the **subscription** you want to check.
-  ![Step1](S-Screenshots/Steps1.png)
+3. Select the **subscription** you want to check.  
+   ![Step1](S-Screenshots/Steps1.png)  
 4. In the subscription’s menu, go to **Settings → Properties**.  
-   - In some UI versions, you may just see **Properties** directly in the menu.
-  ![Step2](S-Screenshots/Steps2.png)  
+   - In some UI versions, you may just see **Properties** directly in the menu.  
+   ![Step2](S-Screenshots/Steps2.png)  
 5. In the **Properties** blade, look for the field **Account admin**.  
-  ![Step3](S-Screenshots/Step3.png)
+   ![Step3](S-Screenshots/Step3.png)  
 6. Copy the email address shown there — this is the **Account Admin (Owner)** of the subscription.  
 
 ---
 
-### 🔍 How the Script Decides **Sub. Type**
+## 🔍 How the Script Decides **Sub. Type**
 The classification is primarily based on **quotaId** (from ARM):
 
 - `MSDN_*` → **MSDN**  
@@ -140,10 +131,8 @@ Additional rules:
 ---
 
 ## 📌 MCA / CSP Notes
-
-- **MCA**: There’s no *Account Admin*. Ownership is managed under **Cost Management + Billing → Role assignments**.  
-  - The script will try to show the **Billing Owner** if you have the **Billing Reader** role.  
-  - Otherwise, you’ll see: *“Check in Billing (MCA)”*.  
+- **MCA**: Ownership is under *Cost Management* + *Billing* → *Role assignments*. 
+  - Script shows the Billing Owner if you have permission. Otherwise: Check in Billing (MCA).   
 
 - **CSP**: These subscriptions are **partner-managed**.  
   - You’ll see: *“Managed by partner – CSP”*.  
@@ -151,15 +140,17 @@ Additional rules:
 ---
 
 ## 🔧 Troubleshooting
-
 - **“Not available” / missing values**  
   - This usually means you don’t have access to ARM or Billing scopes.  
   - Ask for:  
     - **Reader** role (subscriptions)  
     - **Billing Reader** role (billing account / profile / invoice section)  
+
 ---
 
-```bash
-python3 <(curl -s https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure_migration.py)
-```
+# ⚡ Quick Start (advanced users)
 
+If you are already in the correct tenant and Cloud Shell (Bash):
+```bash
+python3 <(curl -s https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/azure_assess_stage1.py)
+   ```

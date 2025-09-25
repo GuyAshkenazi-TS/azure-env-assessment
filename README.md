@@ -148,7 +148,7 @@ Additional rules:
 
 ---
 
-# ⚡ Quick Start (advanced users)
+# ⚡ Quick Start
 
 If you are already in the correct tenant and Cloud Shell (Bash):
 ```bash

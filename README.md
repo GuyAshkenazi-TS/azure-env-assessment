@@ -41,7 +41,7 @@ To run the scripts successfully, make sure your user has:
 Copy and paste:
 
 ```bash
-python3 <(curl -s https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/azure_assess_stage1.py)
+python3 <(curl -s https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure_assess_stage1.py)
    ```
 ## What Stage-1 does
 - Scans all subscriptions in the tenant  
@@ -152,5 +152,5 @@ Additional rules:
 
 If you are already in the correct tenant and Cloud Shell (Bash):
 ```bash
-python3 <(curl -s https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/azure_assess_stage1.py)
+python3 <(curl -s https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure_assess_stage1.py)
    ```
